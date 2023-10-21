@@ -127,7 +127,8 @@ uint8_t IR_CntLast					= 0;
 
 uint8_t IRRepeatDelay				= 0;	// *0.1 sec
 uint8_t IRRepeatCnt					= 0;
-uint8_t Key1Pressed					= 0;	// *20ms
+uint8_t Key1Pressed					= 0;	// *8.2ms
+uint8_t Key1Pressed2				= 0;	// *2sec
 uint8_t Key1Pause					= 0;
 volatile uint8_t Timer				= 0;	// sec
 volatile uint8_t TimerMin			= 0;	// minutes
@@ -153,7 +154,7 @@ enum {
 #define REPEAT_TIMES_SETUP_IR		5
 #define IR_REPEAT_TIMEOUT			2		// *0.1 sec
 #define IR_REPEAT_TIMEOUT_SETUP		50		// *0.1 sec
-#define KEY_PressingTimeMin			4		// *20 msec
+#define KEY_PressingTimeMin			7		// *8.2 msec
 
 // EEPROM.Flags:
 #define f_NRF24						(1<<0)	// Present nRF24L01
@@ -285,7 +286,7 @@ void FlashLED(uint8_t num, uint8_t toff, uint8_t ton) {
 //											// 0xF0 mask - Number of long flashes, 0x0F mask - Number of short flashes
 #define WRN_SETUP					0x01
 #define WRN_SETUP_INFO				0x02
-#define WRN_FAN_SWITCHING			0x10
+#define WRN_FAN_SWITCHING			0x01
 #define WRN_SETUP_ERR				0x10	// +ERR
 #define WRN_RF_Receive				0x01
 #define WRN_RF_Send					0x10	// Send failure, after short bursts = fan offset (mask 0x0F)
@@ -436,17 +437,25 @@ xSetPause:
 	}
 }
 
+uint8_t _IR_Cnt = 0;
+uint8_t _IR_Duration[70];
+uint8_t _IR_Duration1[IR_PULSES_MIN];
 
-ISR(TIM0_OVF_vect) // IR timeout, 20 ms
+ISR(TIM0_OVF_vect) // IR timeout, 7.7 ms
 {
 	if(IR_Status == IR_READING) {
 		if(IR_Cnt > IR_PULSES_MIN) IR_Status = IR_DONE; else IR_Status = IR_WAITING;
 	} else if(IR_Status == IR_START) IR_Status = IR_WAITING;
 	if(IR_Status != IR_DONE) {
 		if(KEY_PRESSING) {
-			if(!Key1Pause && Key1Pressed < 255) Key1Pressed++;
+			if(!Key1Pause) {
+				if(++Key1Pressed == 255) {
+					Key1Pressed2++;
+					Key1Pressed = KEY_PressingTimeMin;
+				}
+			}
 		} else {
-			if(Key1Pressed <= KEY_PressingTimeMin) Key1Pressed = 0;
+			if(Key1Pressed < KEY_PressingTimeMin) Key1Pressed = Key1Pressed2 = 0;
 		}
 	}
 }
@@ -455,7 +464,9 @@ ISR(EXT_INT0_vect) // IR, PIN change
 {
 	if(IR_Status <= IR_READING) {
 		uint8_t _TCNT = TCNT0;
+		if(_TCNT == 0) return;
 		TCNT0 = 0;
+		sei();
 		if(IR_Status == IR_WAITING) {
 			IR_Status = IR_START;
 		} else if(IR_Status == IR_START) {
@@ -465,8 +476,8 @@ ISR(EXT_INT0_vect) // IR, PIN change
 			IR_Status = IR_READING;
 		} else {
 			uint8_t n;
-			if(_TCNT < IR_LastDuration * 3 / 4) n = 1;
-			else if(IR_LastDuration < _TCNT * 3 / 4) n = 2;
+			if(_TCNT < IR_LastDuration * 4 / 6) n = 1;
+			else if(IR_LastDuration < _TCNT * 4 / 6) n = 2;
 			else n = 0;
 			IR_Hash = ((IR_Hash << 5) + IR_Hash) ^ n;
 			IR_LastDuration = _TCNT;
@@ -698,8 +709,8 @@ int main(void)
 	KEY_SETUP;
 	// Timer 8 bit
 	TCCR0A = (1<<WGM01) | (1<<WGM00);  // Timer0: PWM, Fast PWM
-	TCCR0B = (1<<WGM02) | (1 << CS02) | (0 << CS01) | (1 << CS00); // Timer0 prescaller: 1024
-	OCR0A = 155; // =Fclk/prescaller/Freq - 1
+	TCCR0B = (1<<WGM02) | (1 << CS02) | (0 << CS01) | (0 << CS00); // Timer0 prescaller: 256
+	OCR0A = 240; // =Fclk/prescaller/Freq - 1
 	//OCR0B = 0; // Half Duty cycle ((TOP+1)/2-1)
 	TIMSK0 = (1<<TOIE0); // Timer/Counter Overflow Interrupt Enable
 	// Timer 16 bit
@@ -745,6 +756,21 @@ int main(void)
 		__asm__ volatile ("" ::: "memory"); // Need memory barrier
 		sleep_cpu();
 		wdt_reset();
+		if(_IR_Cnt != IR_Cnt) {
+			if(IR_Cnt == 0) {
+				_IR_Cnt = 0;
+			} else if(_IR_Cnt < sizeof(_IR_Duration) / sizeof(_IR_Duration[0])) {
+				if(IR_Cnt <= IR_PULSES_MIN) _IR_Duration1[_IR_Cnt] = IR_LastDuration;
+				else {
+					if(IR_Cnt == IR_PULSES_MIN + 1) {
+						for(uint8_t ii = 0; ii < IR_PULSES_MIN; ii++) _IR_Duration[ii] = _IR_Duration1[ii];
+						for(uint8_t ii = IR_PULSES_MIN; ii < sizeof(_IR_Duration) / sizeof(_IR_Duration[0]); ii++) _IR_Duration[ii] = 0;
+					}
+					_IR_Duration[_IR_Cnt] = IR_LastDuration;
+				}
+				_IR_Cnt = IR_Cnt;
+			}
+		}
 		if(Timer1sec) {
 			Timer1sec = 0;
 			if(++TimerCntFanSleepStep >= FANS_SLEEP_STEP * 60) {
@@ -874,23 +900,22 @@ xSetupIR_New:
 				}
 			}
 		}
-		if(Key1Pressed > KEY_PressingTimeMin) {
-			if(Key1Pressed >= 200) { // > 4 sec
+		if(Key1Pressed >= KEY_PressingTimeMin) {
+			if(Key1Pressed2 >= 3) { // > 6 sec
 				LED1_ON;
-				Key1Pressed = 1;
 				while(KEY_PRESSING) {
 					__asm__ volatile ("" ::: "memory"); // Need memory barrier
 					wdt_reset();
-				}
-				if(Key1Pressed == 255) { // reset settings - pressed > 9 sec
-					ResetSettings();
-					goto xReset;
+					if(Key1Pressed2 >= 7) { // reset settings - pressed > 14 sec
+						ResetSettings();
+						goto xReset;
+					}
 				}
 xStartSetupIR:
 				// Setup IR Commands
 				FlashLED(3, 1, 1);
 				Delay100ms(15);
-				Key1Pressed = 0;
+				Key1Pressed = Key1Pressed2 = 0;
 				uint8_t i = eeprom_read_byte(&EEPROM.IRRemotes);
 				if(i >= IR_MAX_CONTROLS) {
 					FlashLED(50, 1, 1);
@@ -905,7 +930,7 @@ xStartSetupIR:
 				uint8_t i = eeprom_read_byte(&EEPROM.SpeedKeyIdx);
 				SetFanSpeed(/* FanOn == i ? 0 : */ i);
 				Key1Pause = 10;	// 1 sec
-				Key1Pressed = 0;
+				Key1Pressed = Key1Pressed2 = 0;
 			}
 		}
 		if(Flags & f_NRF24) {
